@@ -1,0 +1,523 @@
+---
+title: "ECG Synchrony: Filtering to IBI"
+author: "Jenna Perry"
+output: html_notebook
+---
+
+```{r}
+# load libraries
+library(stringr)
+library(ggplot2)
+
+# needed information
+folder_path <- "C:/Users/Psychology/Desktop/DPRE_ECG_Calcs/Inter-Rater/IBIs/"
+## expecting a file with Rater 3 journals in "CSVs" subfolder, and empty subfolder "Triggers"
+ID_position <- 2 # which underscore-separated term in file name contains ID information?
+roles <- c("P1", "P2")
+
+# codes that mark relevant events in event files
+code_QRS <- "QRS Peak" # event type that indicates QRS complex peak / R spike
+code_P1 <- "Cl" # channel code indicating a QRS peak belongs to Partner 1
+code_P2 <- "Pt" # channel code indicating a QRS peak belongs to Partner 2
+
+# detect existing files
+base_path <- paste(folder_path, "CSVs/", sep="")
+cur_files <- list.files(base_path)
+triggers_path <- paste(folder_path, "Triggers/", sep="")
+```
+
+```{r}
+### EXTRACT ALL R PEAKS TO OWN DATAFRAMES
+### WRITE TRIGGER EVENTS TO OWN CSVs
+
+all_IDs <- vector()
+
+for (j in 1:length(cur_files))
+{
+
+this_ID_string <- strsplit(cur_files[j], "_")[[1]][ID_position]
+all_IDs <- c(all_IDs, this_ID_string)
+
+# read in file
+peaks_file_master <- read.csv(paste(base_path, cur_files, sep="/"), stringsAsFactors = FALSE)
+peaks_file <- peaks_file_master
+
+# descriptive column names
+colnames(peaks_file) <- peaks_file[1,]
+# remove first/last row 
+peaks_file <- peaks_file[-c(1, nrow(peaks_file)),]
+
+# extract all R spike ("QRS Peak") events
+peaks_QRS <- peaks_file[grepl(code_QRS, peaks_file$Type),]
+# from all R spikes, select only Partner 1 ones
+peaks_P1 <- peaks_QRS[grepl(code_P1, peaks_QRS$Channel),]
+# from all R spikes, select only Partner 2 ones
+peaks_P2 <- peaks_QRS[grepl(code_P2, peaks_QRS$Channel),]
+
+# extract "Append" event
+peaks_append <- peaks_file[grepl("Append", peaks_file$Type),] # whole df row
+peaks_append <- peaks_append$Time[1] # time stamp string
+# converting time stamp string to numeric
+peaks_append <- as.numeric(substr(peaks_append, 1, str_length(peaks_append)-4))
+# now peaks_append = time offset in seconds from start of BIOPAC file (i.e. actual 0 sec = how many BIOPAC seconds)
+
+# extract all trigger ("Waveform Onset") events
+peaks_trig <- peaks_file[grepl("Waveform Onset", peaks_file$Type),]
+## delete out extra copy of append that is sometimes present
+delete_row <- grep(peaks_append, peaks_trig$Time)
+if (length(delete_row) > 0)
+{
+ peaks_trig <- peaks_trig[-delete_row,] 
+}
+
+if (nrow(peaks_trig) == 0)
+{
+  writeLines(paste("No triggers exported to journal for ", this_ID_string, ".", sep="")) # print errror
+  all_IDs <- all_IDs[-which(all_IDs == this_ID_string)] # remove from recorded IDs
+  next # skip to next
+}
+
+rownames(peaks_trig) <- seq(1, nrow(peaks_trig))
+
+# create vector of the 3 df names
+peaks_df_names <- c("peaks_trig", "peaks_P1", "peaks_P2")
+# loop through all dfs and apply key changes
+
+for (i in 1:length(peaks_df_names))
+{
+  cur_peaks_df <- get(peaks_df_names[i])
+  
+  # remove last 4 columns
+  cur_peaks_df <- cur_peaks_df[,c(1:2)]
+  # make index column numeric
+  cur_peaks_df[1] <- sapply(cur_peaks_df[1], function(x) as.numeric(as.character(x)))
+  # initialize new last column
+  cur_peaks_df[3] <- 0
+  # descriptive column names
+  colnames(cur_peaks_df) <- c("Index", "Time_String", "Time_Numeric")
+  
+  for (k in 1:nrow(cur_peaks_df)) # convert seconds string to numeric
+  {
+    just_time <- substr(cur_peaks_df$Time_String[k], 1, str_length(cur_peaks_df$Time_String[k])-4)
+    just_time <- as.numeric(just_time)
+    just_time <- just_time - peaks_append # removing offse
+    cur_peaks_df$Time_Numeric[k] <- just_time
+  }
+  
+  if (i == 1) # do only for triggers
+  {
+    cur_peaks_reduce <- cur_peaks_df[,c(1,3)] # save index and time
+
+    # go ahead and write out trigger CSVs... no further calcs are necessary
+    # determine file name for CSV to print
+    printout_name <- paste(this_ID_string, "_Training_Events_Trigger.csv", sep="")
+    write.csv(cur_peaks_reduce, file=paste(triggers_path, printout_name, sep=""), row.names=FALSE)
+  } else # do for peak timestamps
+  {
+    # need to run algorithm on these
+    # write to DFs instead
+    new_df_name <- paste(this_ID_string, "_", strsplit(peaks_df_names[i], "_")[[1]][2], sep="")
+    assign(new_df_name, cur_peaks_df)
+  }
+  
+}
+
+
+  
+
+} # end starting for loop
+
+# clean up
+remove(cur_peaks_df, cur_peaks_reduce, peaks_trig, peaks_P1, peaks_P2, peaks_QRS, peaks_file, peaks_file_master)
+remove(peaks_append, just_time, peaks_df_names)
+remove(this_ID_string, printout_name, new_df_name)
+remove(i, j, k)
+
+```
+
+```{r}
+### INTERPOLATE DISRUPTED PERIODS ###
+# algorithim from: Logier, R., De Jonckheere, J., & Dassonneville, A. (2004). An efficient algorithm for R-R intervals series filtering. Proceedings of the 26th Annual International Conference of the IEEE. San Francisco, CA, US. September 1-5, 2004.
+## https://ieeexplore.ieee.org/abstract/document/1404100/
+
+# Is this the final pass? Do you NOT intend to run this chunk again for a secondary filtering?
+final_pass <- TRUE
+
+if (final_pass)
+{
+  # create vectors to store errors that need to be handled before proceeding with writing out data
+  ## contains vectors of size 2 with (1) subject ID / role string and (2) start index of ending disrupted period
+  #errors_enddisrupt <- vector() 
+  # # # not strictly necessary to record sequences with end disruption... will be edited out with removal of NAs
+  ## contains vectors of size 2 with (1) subject ID / role string and (2) percentage of data interpolated
+  errors_toointerp <- vector()
+  interpolation_percent_max <- 0.20 # maximum percentage of data that can be interpolated across one segment before considered noisy
+  ## data with percent interpolated over this threshold will not be noted
+}
+
+
+
+for (j in 1:length(all_IDs))
+{
+for (role_num in 1:2)
+{
+
+role <- roles[role_num]
+
+cur_peaks_df <- get(paste(all_IDs[j], "_", role, sep=""))
+rownames(cur_peaks_df) <- seq(1, nrow(cur_peaks_df))
+
+### CALCULATE INITIAL PASS AT IBI'S ###
+# initialize IBI column
+cur_peaks_df$IBI <- NA
+cur_peaks_df$IBI_Interp <- NA
+
+for (i in 2:nrow(cur_peaks_df)) # skip first row... no previous beat to compare to
+{
+  cur_peaks_df$IBI[i] <- cur_peaks_df$Time_Numeric[i] - cur_peaks_df$Time_Numeric[i-1]
+}
+
+
+all_interpolated_indices <- vector()
+
+continue_running <- TRUE
+storage_indexes <- vector() # initialize vector of indexes that are currently undetermined
+window_start <- 1 # starting on row 2 (after +1 in first line) because row 1 is an NA
+while (continue_running)
+{
+  # increment
+  window_start <- window_start + 1
+  
+  # calculate values for this iteration
+  window_end <- window_start + 19
+  cur_i_sample_index <- window_end + 1
+  cur_i_sample <- cur_peaks_df$IBI[cur_i_sample_index] # IBI[i]
+  cur_ip1_sample <- cur_peaks_df$IBI[cur_i_sample_index + 1] # IBI[i+1]
+  if (!is.na(cur_peaks_df$IBI_Interp[cur_i_sample_index - 1]))
+  {
+    cur_im1_sample <- cur_peaks_df$IBI_Interp[cur_i_sample_index - 1] # IBI[i-1]  
+  } else
+  {
+    cur_im1_sample <- cur_peaks_df$IBI[cur_i_sample_index - 1] # IBI[i-1]
+  }
+  
+  
+  ### END IF AT END OF SAMPLE ###
+  if (window_end > nrow(cur_peaks_df) - 2)
+  {
+    continue_running <- FALSE
+    break
+  }
+  
+  ### IDENTIFY WRONG VS. CORRECT BEATS ###
+  
+  # ONLY UPDATE IF NO BEATS CURRENTLY IN STORAGE #
+  if (length(storage_indexes) == 0)
+  {
+    # STEP ONE. Calculate thresholds for "correct" beats.
+    ## take the mean and SD of previous 20sec of R-R intervals
+    ## lower threshold: m20 - 2??20
+    ## upper threshold: m20 + 2??20
+    window_vector <- cur_peaks_df$IBI[window_start : window_end]
+    M20 <- mean(window_vector)
+    SD20 <- sd(window_vector)
+    lower_thresh <- M20 - (2 * SD20)
+    upper_thresh <- M20 + (2 * SD20)
+  }
+  # OTHERWISE, USING EXISTING VALUES #
+  
+  # STEP TWO. Compare to three conditions that indicate the sample RR interval is "wrong."
+  ## 1A. RRi < m20 - 2??20 
+  ## 1B. RRi+1 > m20 + 2??20
+  ## 2A. RRi < 0.75 RRi-1
+  ## 2B. RRi+1 < 0.75 RRi-1
+  ## 3.  RRi > 1.75 RRi-1
+  condition_1A <- (cur_i_sample < lower_thresh)
+  condition_1B <- (cur_ip1_sample > upper_thresh)
+  condition_2A <- (cur_i_sample < (0.75 * cur_im1_sample))
+  condition_2B <- (cur_ip1_sample < (0.75 * cur_im1_sample))
+  condition_3 <- (cur_i_sample > (1.75*cur_im1_sample))
+  
+  # Compare to "right" conditions.
+  ## m20 - 2??20 <= RRi <= m20 + 2??20
+  condition_R1 <- (lower_thresh < cur_i_sample)
+  condition_R2 <- (cur_i_sample < upper_thresh)
+
+  conditions_wrong <- condition_1A | condition_1B | condition_2A | condition_2B | condition_3
+  conditions_right <- condition_R1 & condition_R2
+  
+  # STEP THREE. Take appropriate action based on this sample point's flag.
+
+  # IF ANY WRONG CONDITIONS ARE TRUE
+  ## flag as WRONG
+  ## move all samples in "storage" to wrong
+  # rebuild for all wrong samples (including ones just in storage)
+  ### bypasses if statements ###
+  
+  if (conditions_right & !conditions_wrong)
+  {
+    # IF NO WRONG CONDITIONS ARE TRUE and BOTH RIGHT CONDITIONS ARE TRUE
+    ## flag as CORRECT: set this beat's interpolated value to its original value
+    cur_peaks_df$IBI_Interp[cur_i_sample_index] <- cur_i_sample
+    ## move all samples in "storage" to correct: set all storage beats' interpolated values to their original values
+    if (length(storage_indexes) != 0) # only do if there even are samples in storage
+    {
+      for (x in 1:length(storage_indexes))
+      {
+        cur_peaks_df$IBI_Interp[storage_indexes[x]] <- cur_peaks_df$IBI[storage_indexes[x]]
+      }      
+    }
+
+    storage_indexes <- vector() # clear out the storage vector
+    ## re-calculate m20 and ??20 considering all beats in 20s preceding next sample to be examined
+    ### recalculation triggered in next iteration of loop by setting storage_indexes to 0
+    # move to next loop iteration
+    next
+  } else if (!conditions_wrong)
+  {
+    # OTHERWISE (no "wrong" conditions true, but not all "right" conditions met)
+    ## flag as indeterminate
+    ## hold this sample in "storage"
+    storage_indexes <- c(storage_indexes, cur_i_sample_index)
+    # move to next loop iteration
+    next
+  } 
+  
+  
+  # STEP FOUR. Apply rebuilding algorithm to wrong samples.
+  
+  ### REBUILDING ALGORITHM
+  rebuilding <- TRUE
+  to_rebuild_indexes <- c(storage_indexes, cur_i_sample_index)
+  this_rebuild_counter <- 0
+  while(rebuilding)
+  {
+    # Execute rebuilding algorithm for current group of wrong samples ("disturbed period").
+    
+    # point zero = index of last sample marked as correct (last sample before the disturbed period)
+    zero_index <- to_rebuild_indexes[1] - 1 # find index immediately before first index in to_rebuild_indexes
+    # point m = the first sample after the disturbed period
+    m_index <- to_rebuild_indexes[length(to_rebuild_indexes)] + 1 # find index immediately after last index in to_rebuild_indexes
+    
+    if(m_index > nrow(cur_peaks_df)) # the disrupted period does not end before the end of the data set
+    {
+
+      continue_running <- FALSE
+      break
+    }
+    
+    # variables
+    ## RR[0] = the last sample marked as correct (last sample before the disturbed period)
+    if (!is.na(cur_peaks_df$IBI_Interp[zero_index]))
+    {
+      RR_zero <- cur_peaks_df$IBI_Interp[zero_index]
+    } else
+    {
+      RR_zero <- cur_peaks_df$IBI[zero_index]
+    }
+    ## RR[m] = the first sample after the disturbed period
+    RR_m <- cur_peaks_df$IBI[m_index]
+    ## T[0] = the time point of RR[0]
+    T_zero <- cur_peaks_df$Time_Numeric[zero_index]
+    ## T[m] = the time point of RR[m]
+    T_m <- cur_peaks_df$Time_Numeric[m_index]
+    
+    # formulas
+    ## T = the interpolation duration = T[m]- T[0]
+    ## also: T = sum(i=0, to n){ES[i]} + RR[m]
+    ### n = number of erroneous samples in queue
+    ### ES[i] = erroneous sample value
+    T_dur <- T_m - T_zero
+
+    
+    # rebuilt area straight line variables
+    ## a = RR[m] - RR[0] / T
+    a_value <- (RR_m - RR_zero) / T_dur
+    ## b = RR[0]
+    b_value <- RR_zero
+    
+    # rebuilt area straight line calculation
+    to_rebuild_interp <- vector()
+    for (x in to_rebuild_indexes)
+    {
+      ## RR[i] = a*T[i] + b
+      
+      ## T[i] = the time point of RR[i]
+      T_i <- cur_peaks_df$Time_Numeric[x] - T_zero
+      ## RR[i] = the sample being computed
+      RR_i <- (a_value * T_i) + b_value
+      
+      # add to current list of interpolated values
+      to_rebuild_interp <- c(to_rebuild_interp, RR_i)
+    }
+    
+    if (length(to_rebuild_indexes) != length(to_rebuild_interp))
+    {
+      print("ERROR: Uneven lengths of to_rebuild_indexes and to_rebuild_interp.")
+    }
+    
+    
+    # Validate the rebuilt samples.
+    ## examine first and last RRs of the interpolated area (RR[1] and RR[n])
+    RR_one <- to_rebuild_interp[1]
+    RR_n <- to_rebuild_interp[length(to_rebuild_interp)]
+    ## compare to samples just outside the interpolated area (RR[0] and RR[m])
+    # check that both are true:
+    buffer <- 0.4 # original authors recommend 10%
+    ## RR[1] = RR[0] +/- 10%
+    valid_1_low <- (1 - buffer) * RR_zero
+    valid_1_hi <- (1 + buffer) * RR_zero
+    valid_1 <- (RR_one >= valid_1_low) & (RR_one <= valid_1_hi)
+    ## RR[n] = RR[m] +/- 10%
+    valid_2_low <- (1 - buffer) * RR_m
+    valid_2_hi <- (1 + buffer) * RR_m
+    valid_2 <- (RR_n >= valid_2_low) & (RR_n <= valid_2_hi)
+    
+    if (valid_1 & valid_2) # both are true
+    {
+      
+      # assign these interpolated values to their respective df values
+      for (x in 1:length(to_rebuild_indexes))
+      {
+        cur_index <- to_rebuild_indexes[x]
+        cur_value <- to_rebuild_interp[x]
+        cur_peaks_df$IBI_Interp[cur_index] <- cur_value
+      }
+      
+      if (final_pass)
+      {
+        # add to total length of interpolated indices
+        all_interpolated_indices <- c(all_interpolated_indices, to_rebuild_indexes)
+      }
+      
+      # clear out stored samples
+      storage_indexes <- vector()
+      to_rebuild_indexes <- vector()
+      
+      # mark rebuilding finished
+      rebuilding <- FALSE
+      
+    } else # at least one is false
+    {
+      
+      # if either is false:
+      ## consider RR[m] as wrong sample
+      to_rebuild_indexes <- c(to_rebuild_indexes, m_index)
+      ## attempt rebuilding algorithm again using new (extended by 1) group of wrong samples  
+      ### go to next iteration of while loop
+    }
+    
+  } #end "while rebuilding" loop
+
+} #end "continue_running" loop
+
+if (final_pass)
+{
+  # test if too much of this sequence was interpolated
+  total_observations <- nrow(cur_peaks_df) - 20 - 1 # minus initial window size, minus initial peak (no IBI calculated bc no R before)
+  total_interpolated <- length(all_interpolated_indices)
+  maximum_interpolated <- ceiling(interpolation_percent_max * total_observations)
+  if (total_interpolated > maximum_interpolated) # too much interpolation
+  {
+    this_ID <- paste(all_IDs[j], "_", role, sep="")
+    errors_toointerp <- c(errors_toointerp, c(this_ID, (total_interpolated / total_observations))) 
+  }
+}
+
+
+
+cur_peaks_df$Time_Adj <- NA
+for (i in 2:nrow(cur_peaks_df))
+{
+  prev_time <- cur_peaks_df$Time_Numeric[i-1]
+  IBI_from_prev <- cur_peaks_df$IBI_Interp[i]
+  this_time <- prev_time + IBI_from_prev
+  cur_peaks_df$Time_Adj[i] <- this_time
+}
+
+assign(paste(all_IDs[j], "_", role, "_IBI", sep=""), cur_peaks_df)
+writeLines(paste("Finished ", all_IDs[j], "_", role, sep=""))
+
+} #end starting loop (role_num)
+} #end starting loop (j)
+
+# cleanup
+remove(cur_peaks_df)
+remove(M20, SD20)
+remove(window_start, window_end, window_vector)
+remove(cur_index, cur_i_sample_index, cur_i_sample, cur_ip1_sample, cur_im1_sample)
+remove(a_value, b_value, RR_i, RR_m, RR_n, RR_one, RR_zero, T_dur, T_i, T_m, T_zero, m_index, zero_index)
+remove(condition_1A, condition_1B, condition_2A, condition_2B, condition_3, condition_R1, condition_R2, conditions_wrong, conditions_right)
+remove(valid_1, valid_1_hi, valid_1_low, valid_2, valid_2_hi, valid_2_low, lower_thresh)
+remove(j, role_num, role, i, x)
+remove(storage_indexes, to_rebuild_indexes, to_rebuild_interp)
+remove(continue_running, rebuilding)
+remove(this_rebuild_counter)
+remove(cur_value)
+remove(prev_time, IBI_from_prev, this_time)
+
+```
+
+```{r}
+### FILTER OUT ERRONEOUS SEGMENTS
+# Before running this chunk, must have ran interpolation chunk with "final_pass = TRUE".
+
+if (length(errors_toointerp) > 0) # at least 1 instance of too much interpolation
+{
+  errors_toointerp_message <- ""
+  for (i in 1:(length(errors_toointerp)/2))
+  {
+    this_ID <- errors_toointerp[((i-1)*2) + 1]
+    this_partici <- substr(this_ID, 1, 10)
+    this_role <- substr(this_ID, 12, 13)
+    this_percentage <- round(as.numeric(errors_toointerp[((i-1)*2) + 2]), digits=5) * 100
+
+    errors_toointerp_message <- c(errors_toointerp_message, paste("Omitting dyad ", this_partici, " due to ", this_percentage, "% of data interpolated in ", this_role, " sequence.\n", sep=""))
+  }
+  
+  writeLines(errors_toointerp_message)
+}
+
+```
+
+```{r}
+### ISOLATE IBI AND WRITE CSVS
+
+for (j in 1:length(all_IDs))
+{
+for (role_num in 1:2)
+{
+
+if (role_num == 1)
+{
+  
+role <- roles[role_num]
+
+cur_peaks_df <- get(paste(all_IDs[j], "_", role, "_IBI", sep=""))
+rownames(cur_peaks_df) <- seq(1, nrow(cur_peaks_df))
+
+# put non-interpolated IBI in place of first 20 rows (used as initial reference window)
+for (i in 2:21)
+{
+  cur_peaks_df$IBI_Interp[i] <- cur_peaks_df$IBI[i]
+}
+
+# filter out any NAs (especially ending ones)
+cur_peaks_df <- cur_peaks_df[which(!is.na(cur_peaks_df$IBI_Interp)),]
+
+time_before_first <- cur_peaks_df$Time_Numeric[1]
+
+cur_peaks_reduce <- cur_peaks_df$IBI_Interp
+cur_peaks_reduce <- c(time_before_first, cur_peaks_reduce)
+
+# determine file name for CSV to print
+printout_name <- paste(all_IDs[j], "_", role, ".csv", sep="")
+printout_folder <- paste(folder_path, "Filtered IBIs/", sep="")
+
+write.csv(cur_peaks_reduce, file=paste(printout_folder,printout_name,sep=""), row.names=FALSE)
+
+
+}
+}
+
+```

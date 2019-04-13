@@ -1,0 +1,938 @@
+---
+title: "ECG Synchrony: Interrater Validation"
+author: "Jenna Perry"
+output: html_notebook
+---
+
+```{r}
+# load libraries
+library(stringr)
+library(ggplot2)
+
+# defining reporting function
+full_report <- "" # initialize variable for full report
+report_add <- function(addendum)
+{
+  full_report <- paste(full_report, addendum, sep="\n")
+}
+
+# needed information
+base_path <- "C:/Users/Psychology/Desktop/DPRE_ECG_Calcs/" # Rater 1 folder
+## expecting a folder with rater 1's files in "R1/CSVs" and rater 2's files in "R2/CSVs"
+max_ppt_num <- 170 # last assigned participant ID number
+ID_position <- 2 # which underscore-separated term in file name contains ID information?
+roles <- c("P1", "P2") 
+
+# codes that mark relevant events in event files
+code_QRS <- "QRS Peak" # event type that indicates QRS complex peak / R spike
+code_P1 <- "Cl" # channel code indicating a QRS peak belongs to Partner 1
+code_P2 <- "Pt" # channel code indicating a QRS peak belongs to Partner 2
+
+
+# define directories
+base_path_R1 <- paste(base_path, "R1/CSVS/", sep="/")
+base_path_R2 <- paste(base_path, "R2/CSVS/", sep="/")
+base_path_IR <- paste(base_path, "Inter-Rater/", sep="/")
+
+```
+
+```{r}
+### CHECK NUMBER OF EXCLUDED PARTICIPANTS ###
+cur_files_R1 <- list.files(path=base_path_R1)
+cur_files_R1 <- cur_files_R1[grepl(".csv", cur_files_R1)]
+
+cur_files_R2 <- list.files(path=base_path_R2)
+cur_files_R2 <- cur_files_R2[grepl(".csv", cur_files_R2)]
+
+included_IDs <- vector() # initialize vector for excluded IDs
+
+if (length(cur_files_R1) == length(cur_files_R2)) # files organized such that exact same number of files necessitates equivalence
+{
+  full_report <- report_add("EXCLUDED PARTICIPANTS: Full match found.")
+  for (i in 1:length(cur_files_R1)) # read in all mutually used IDs
+  {
+    this_id <- strsplit(cur_files_R1[i], "_")[[1]][ID_position]
+    included_IDs <- c(included_IDs, this_id)
+  }
+} else # need to check which ones were excluded in one and not the other
+{
+  full_report <- report_add("EXCLUDED PARTICIPANTS: Full match not found. Differences in exclusion for IDs:")
+for (i in 1:max_ppt_num)
+{
+  # assemble current ID to check for
+  cur_id <- ""
+  if (i < 10) # 1 character number component
+  {
+    cur_id <- paste("P200", i, sep="")
+  } else if (i < 100) # 2 character number component
+  {
+    cur_id <- paste("P20", i, sep="")
+  } else # 3 character number component
+  {
+    cur_id <- paste("P2", i, sep="")
+  }
+  
+  # check for presence of ID
+  present_R1 <- sum(grepl(cur_id, cur_files_R1)) > 0
+  present_R2 <- sum(grepl(cur_id, cur_files_R2)) > 0
+  
+  # compare
+  if (present_R1 != present_R2)
+  {
+    full_report <- report_add(cur_id)
+  } else if (present_R1 == TRUE & present_R2 == TRUE)
+  {
+    included_IDs <- c(included_IDs, cur_id)
+  }
+  
+} # end bracket for for loop
+} # end bracket for else statement
+
+# clean up
+writeLines(full_report)
+remove(max_ppt_num)
+```
+
+```{r}
+### CONVERT CSVs TO DATAFRAMES ###
+
+for (i in 1:2) # do for both raters
+{
+  cur_files <- get(paste("cur_files_R", i, sep=""))
+  base_path <- get(paste("base_path_R", i, sep=""))
+for (j in 1:length(included_IDs)) # do for all IDs rated by both
+{
+# find file name for this ID
+file_name <- cur_files[grepl(included_IDs[j], cur_files)] # should only return 1 value
+
+# read in file
+peaks_file <- read.csv(paste(base_path, file_name, sep=""), stringsAsFactors = FALSE)
+
+# remove first/last row 
+peaks_file <- peaks_file[-c(1, nrow(peaks_file)),]
+# descriptive column names
+colnames(peaks_file) <- c("Orig_Index", "Time", "Type", "Channel", "Label")
+
+# extract all R spike ("QRS Peak") events
+peaks_QRS <- peaks_file[grepl(code_QRS, peaks_file$Type),]
+# from all R spikes, select only Partner 1 ones
+peaks_P1 <- peaks_QRS[grepl(code_P1, peaks_QRS$Channel),] # cl = clinician
+# from all R spikes, select only Partner 2 ones
+peaks_P2 <- peaks_QRS[grepl(code_p2, peaks_QRS$Channel),]
+
+# extract "Append" event
+peaks_append <- peaks_file[grepl("Append", peaks_file$Type),] # whole df row
+peaks_append <- peaks_append$Time[1] # time stamp string
+# converting time stamp string to numeric
+peaks_append <- as.numeric(substr(peaks_append, 1, str_length(peaks_append)-4))
+# we will place an event at this (the earliest point in the segment) to help identify early beats placed by one rater and not the other
+
+# remove last columns
+peaks_P1 <- peaks_P1[,1:2]
+peaks_P2 <- peaks_P2[,1:2]
+# make original index column numeric
+peaks_P1[1] <- sapply(peaks_P1[1], function(x) as.numeric(as.character(x)))
+peaks_P2[1] <- sapply(peaks_P2[1], function(x) as.numeric(as.character(x)))
+# make seconds numeric
+peaks_P1[2] <- apply(peaks_P1[2], 1, FUN=function(x){
+  just_time <- substr(x, 1, str_length(x)-4)
+  just_time <- as.numeric(just_time)
+  just_time <- just_time - peaks_append # delete offset
+})
+peaks_P2[2] <- apply(peaks_P2[2], 1, FUN=function(x){
+  just_time <- substr(x, 1, str_length(x)-4)
+  just_time <- as.numeric(just_time)
+  just_time <- just_time - peaks_append # delete offset
+  
+})
+# apply heartbeat index column
+peaks_P1$Index <- seq(1, nrow(peaks_P1))
+peaks_P2$Index <- seq(1, nrow(peaks_P2))
+# correct row numbers
+rownames(peaks_P1) <- seq(1, nrow(peaks_P1))
+rownames(peaks_P2) <- seq(1, nrow(peaks_P2))
+
+
+# place a "beat" at the starting point of the segment (peaks_append)
+peaks_starter <- as.data.frame(matrix(NA, nrow=1, ncol=3))
+colnames(peaks_starter) <- c("Orig_Index", "Time", "Index")
+peaks_starter$Orig_Index[1] <- 0
+peaks_starter$Index[1] <- 0
+peaks_starter$Time[1] <- 0
+
+peaks_P1 <- rbind(peaks_starter, peaks_P1)
+peaks_P2 <- rbind(peaks_starter, peaks_P2)
+
+# delete duplicate beats (accidentally placed two beats on same place; result of double click)
+deleterows_P1 <- vector()
+deleterows_P2 <- vector()
+for (k in 1:(nrow(peaks_P1)-1))
+{
+  if(peaks_P1$Time[k] == peaks_P1$Time[k+1])
+  {
+    deleterows_P1 <- c(deleterows_P1, k)
+  }
+}
+for (k in 1:(nrow(peaks_P2)-1))
+{
+  if(peaks_P2$Time[k] == peaks_P2$Time[k+1])
+  {
+    deleterows_P2 <- c(deleterows_P2, k)
+  }
+}
+
+if (length(deleterows_P1) > 0)
+{
+  peaks_P1 <- peaks_P1[-c(deleterows_P1),]  
+}
+if (length(deleterows_P2) > 0)
+{
+  peaks_P2 <- peaks_P2[-c(deleterows_P2),]
+}
+
+# save new DFs
+assign(paste(included_IDs[j], "_P1_R", i, sep=""), peaks_P1)
+assign(paste(included_IDs[j], "_P2_R", i, sep=""), peaks_P2)
+
+#writeLines(paste("Finished with ", included_IDs[j], " for Rater ", i, ".", sep=""))
+} # end initial for loop (j)
+} # end initial for loop (i)
+
+# Clean Up
+remove(deleterows_P1, deleterows_P2, cur_files, file_name, i, j, k, peaks_append)
+remove(peaks_P1, peaks_file, peaks_P2, peaks_QRS, peaks_starter)
+```
+
+```{r}
+### COMPARE AND MERGE TWO RATERS' INDICATIONS ###
+
+### START FOR LOOP / GET CURRENT DATA FRAMES
+for (role_num in 1:2) # do for dr and pt
+{
+role <- roles[role_num]
+
+for (j in 1:length(included_IDs))
+{
+cur_R1_df_master <- get(paste(included_IDs[j], "_", role, "_R1", sep=""))
+cur_R2_df_master <- get(paste(included_IDs[j], "_", role, "_R2", sep=""))
+
+
+
+
+### COMPARE NUMBER OF HEARTBEATS ###
+
+cur_R1_df <- cur_R1_df_master
+cur_R2_df <- cur_R2_df_master
+
+# First, define "anchor points." These are points where the timestamp are exactly the same... so it clearly refers to the same peak.
+## Almost certainly peaks placed correctly by the BIOPAC algorithm.
+
+if (min(nrow(cur_R1_df), nrow(cur_R2_df)) == nrow(cur_R1_df)) # R1's df is shorter
+{
+  min_df <- cur_R1_df
+  max_df <- cur_R2_df
+} else # R2's df is shorter
+{
+  min_df <- cur_R2_df
+  max_df <- cur_R1_df
+}
+
+min_df$Anchor <- NA
+m <- 1 # start with max_dif's 1st row
+for (k in 1:nrow(min_df))
+{
+    if (m > nrow(max_df)) # no more rows to search through
+    {
+      break # kill the loop
+    }
+    if(min_df$Time[k] == max_df$Time[m])
+    {
+      min_df$Anchor[k] <- max_df$Index[m] # anchor this df's row to the other df's exact same time stamp
+      m <- m + 1 # don't look for a match for an anchor at this row or earlier anymore
+    }
+    else
+    {
+      # look for this timestamp's twin in max_df
+      # look from current row in max_df to the end
+      # stop when we find it, or if we pass where it would be, or if we reach the end
+      for (x in m:nrow(max_df))
+      {
+        if (max_df$Time[x] == min_df$Time[k])
+        {
+          min_df$Anchor[k] <- max_df$Index[x] # anchor this df's row to the other df's exact same time stamp
+          m <- x + 1 # don't look for a match for an anchor at this row or earlier anymore
+        } else if (max_df$Time[x] > min_df$Time[k])
+        {
+          break # kill the for loop
+        } # else: keep looking
+      }
+    }
+}
+
+# assemble anchored dataframe
+combined_df <- as.data.frame(matrix(NA, nrow=nrow(max_df), ncol=4))
+colnames(combined_df) <- c("Index_1", "Time_1", "Index_2", "Time_2")
+
+# fill in all max_df values
+combined_df$Index_1 <- max_df$Index
+combined_df$Time_1 <- max_df$Time
+
+# fill in anchored min_df values
+for (lmno in 1:nrow(min_df))
+{
+  if (!is.na(min_df$Anchor[lmno])) # if this row is anchored
+  { # associate it with its anchor
+    
+    # find anchor row
+    combined_row <- which(combined_df$Index_1 == min_df$Anchor[lmno])
+    
+    combined_df$Index_2[combined_row] <- min_df$Index[lmno]
+    combined_df$Time_2[combined_row] <- min_df$Time[lmno]
+    # using the Anchor rows in min_df, because they are based on max_df row numbers
+    # at this point, combined_df uses exact same row numbers as max_df
+  }
+}
+writeLines(paste(included_IDs[j], " STEP ONE: Anchored dataframe assembled.", sep=""))
+
+
+
+# fill in non-anchored min_df values
+for (cur_NA_row in which(is.na(min_df$Anchor)))
+{
+  
+  # cur_NA_row is the row number of the non-anchored row in min_df
+  
+  # find the closest non-NA before this NA
+  before_anchor_row <- NA
+  for (xyz in 1:(cur_NA_row-1))
+  {
+    if (!is.na(min_df$Anchor[cur_NA_row-xyz]))
+    {
+      before_anchor_row <- cur_NA_row-xyz
+      before_anchor <- min_df$Anchor[before_anchor_row]
+      break
+    }
+  } # at worst, will always be 1... as both dfs have already had a 0 added to the top
+  
+  # find the closest non-NA after this NA
+  after_anchor_row <- NA
+  for (xyz in 1:(nrow(min_df)-cur_NA_row))
+  {
+    if (!is.na(min_df$Anchor[cur_NA_row+xyz]))
+    {
+      after_anchor_row <- cur_NA_row+xyz
+      after_anchor <- min_df$Anchor[after_anchor_row]
+      break
+    }
+  }
+  if (is.na(after_anchor_row)) # if after all that, after_anchor is still NA
+  {
+    # just set to last row
+    after_anchor_row <- nrow(combined_df)
+    after_anchor <- combined_df$Index_1[after_anchor_row]
+    
+    # find last non-NA
+    while (is.na(after_anchor))
+    {
+      after_anchor_row <- after_anchor_row - 1
+      after_anchor <- combined_df$Index_1[after_anchor_row]
+    }
+  }
+  
+  # now, find out where this NA belongs in the combined_df
+  ## figure out where to start and stop looking for this value's place
+  start_check <- which(combined_df$Index_1 == before_anchor)
+  stop_check <- which(combined_df$Index_1 == after_anchor)
+  
+  ## find the first row where the value is greater than this value
+  correct_place <- NA
+  for (xyz in (start_check+1):(stop_check-1))
+  {
+    if (xyz+1 > nrow(combined_df)) # we're dealing with the last row
+    {
+      # check if this value goes before or after the last row
+      if(!is.na(combined_df$Time_1[xyz]))
+      {
+        last_value <- combined_df$Time_1[xyz]
+      }
+      else
+      {
+        last_value <- combined_df$Time_2[xyz]
+      }
+      
+      if (is.na(last_value)) # if it's STILL an NA...
+      {
+          # something is weird: skip this iteration of the loop
+          print(paste("ERROR: Could not identify correct place for non-anchored value ", min_df$Time[cur_NA_row], " because row ", xyz, " has no time stamp for comparison", sep=""))
+          next
+      }
+      
+      if(last_value < min_df$Time[cur_NA_row])
+      {
+        # greater than last row
+        # should go at very end
+        correct_place <- xyz+1
+      }
+      else
+      {
+        # lesser than last row
+        # should go right before current last row
+        correct_place <- xyz
+      }
+      
+      break # kill the loop
+      
+      
+    }
+    else
+    {
+      cur_combine_value <- combined_df$Time_1[xyz+1] # find the value of the next row, to check if this value is less than that
+      if(is.na(cur_combine_value))
+      {
+        # we've arrived at a row where we have a value for Time_2 but not Time_1
+        # instead, use the Time_2 value
+        cur_combine_value <- combined_df$Time_2[xyz+1]
+        
+        if(is.na(cur_combine_value))
+        {
+          
+        }
+        
+        if (is.na(cur_combine_value)) # if it's STILL an NA...
+        {
+          # something is weird: skip this iteration of the loop
+          print(paste("ERROR: Could not identify correct place for non-anchored value ", min_df$Time[cur_NA_row], " because row ", xyz, " has no time stamp for comparison", sep=""))
+          next
+        }
+      }
+      
+      if(cur_combine_value > min_df$Time[cur_NA_row])
+      {
+        # the value associated with the row after this is greater than the value associated with our un-anchored row
+        # therefore the unanchored value should go immediately before the row with the greater value (this row)
+        correct_place <- xyz
+        break # kill the loop
+      }
+    }
+  }
+  
+  if (is.na(correct_place))
+  {
+    maximum_last <- max(combined_df$Time_1[nrow(combined_df)], combined_df$Time_2[nrow(combined_df)], na.rm=T)
+    if (maximum_last < min_df$Time[cur_NA_row]) # this value needs to go at the end
+    {
+      correct_place <- nrow(combined_df) + 1
+    }
+    else
+    {
+      print(paste("ERROR: Could not identify correct place for non-anchored value ", min_df$Time[cur_NA_row], sep=""))    
+      next # go to next non-anchored value and try to place it  
+    }
+  }
+  
+  # we have found the row into which we need to place this un-anchored value, so let's place it
+  
+  ## make new row df
+  temporary_df <- as.data.frame(matrix(data=NA, nrow=1, ncol=4))
+  colnames(temporary_df) <- colnames(combined_df)
+  temporary_df$Index_2[1] <- min_df$Index[cur_NA_row]
+  temporary_df$Time_2[1] <- min_df$Time[cur_NA_row]
+  
+  if (correct_place <= nrow(combined_df))
+  {
+    ## separate out existing combined df
+    top_half <- combined_df[1:(correct_place-1),]
+    bottom_half <- combined_df[seq((correct_place), nrow(combined_df)),]
+    
+    ## reassemble and correct row numbers
+    temporary_df <- rbind(top_half, temporary_df, bottom_half)
+    rownames(temporary_df) <- seq(1, nrow(temporary_df))
+  } else # greater than end
+  {
+    temporary_df <- rbind (combined_df, temporary_df)
+  }
+
+  
+  ## reassign
+  combined_df <- temporary_df
+  
+}
+
+writeLines(paste(included_IDs[j], " STEP TWO: Non-anchored values incorporated.", sep=""))
+
+
+
+
+# now, we need to create a df with extremely similar timestamps (i.e. almost certainly representing same beat) side-by-side
+
+aligned_df <- combined_df
+
+continue_running <- TRUE
+iter <- 1
+while (continue_running)
+{
+  # stop at the end, no matter what
+  if (iter >= nrow(aligned_df))
+  {
+    continue_running <- FALSE
+    break
+  }
+  
+  # go to next row if neither rater has an NA in their column
+  if (!is.na(aligned_df$Index_1[iter]) & !is.na(aligned_df$Index_2[iter]))
+  {
+    iter <- iter + 1
+    next
+  }
+  
+  # delete this row if both have an NA
+  if (is.na(aligned_df$Index_1[iter] & is.na(aligned_df$Index_2[iter])))
+  {
+    aligned_df <- aligned_df[-c(iter),]
+    next
+  }
+  
+  
+  
+  # find the relevant uninterrupted sequence of NAs in both columns
+  I1_NAs <- vector()
+  I2_NAs <- vector()
+  
+  if (is.na(aligned_df$Index_1[iter])) # first NA row is in I1 column
+  {
+    cur_I1_row <- iter
+    while (is.na(aligned_df$Index_1[cur_I1_row]) & cur_I1_row <= nrow(aligned_df))
+    {
+      # while this row is actually an NA (uninterrupted flow of NAs... stop when you get a non-NA)
+      # add to the list of NAs
+      I1_NAs <- c(I1_NAs, cur_I1_row)
+      cur_I1_row <- cur_I1_row + 1
+    }
+    
+    cur_I2_row <- iter + length(I1_NAs)
+    while (is.na(aligned_df$Index_2[cur_I2_row]) & cur_I2_row <= nrow(aligned_df))
+    {
+      # while this row is actually an NA (uninterrupted flow of NAs... stop when you get a non-NA)
+      # add to the list of NAs
+      I2_NAs <- c(I2_NAs, cur_I2_row)
+      cur_I2_row <- cur_I2_row + 1
+    }
+  } else # first NA is in I2 column
+  {
+    cur_I2_row <- iter
+    while (is.na(aligned_df$Index_2[cur_I2_row]) & cur_I2_row <= nrow(aligned_df))
+    {
+      # while this row is actually an NA (uninterrupted flow of NAs... stop when you get a non-NA)
+      # add to the list of NAs
+      I2_NAs <- c(I2_NAs, cur_I2_row)
+      cur_I2_row <- cur_I2_row + 1
+    }
+    
+    cur_I1_row <- iter + length(I2_NAs)
+    while (is.na(aligned_df$Index_1[cur_I1_row]) & cur_I1_row <= nrow(aligned_df))
+    {
+      # while this row is actually an NA (uninterrupted flow of NAs... stop when you get a non-NA)
+      # add to the list of NAs
+      I1_NAs <- c(I1_NAs, cur_I1_row)
+      cur_I1_row <- cur_I1_row + 1
+    }
+  }
+  
+
+
+  
+  
+  
+  
+  if (length(I1_NAs) == 0 | length(I2_NAs) == 0)
+  {
+    # one of the columns has 1+ NAs; the other has none
+    ## one rater placed a beat that the other did not place a comparable beat for
+    # do nothing (leave NAs) and continue on
+    
+    iter <- iter + 1
+  } else if (length(I1_NAs) == length(I2_NAs))
+  {
+    # each column has exact same number of NAs in same position
+    ## these are almost certainly meant to be the same beat
+    
+    # create a data frame aligning these values correctly
+    ## initialise the df
+    cur_insertion <- as.data.frame(matrix(data=NA, nrow=length(I1_NAs), ncol=4))
+    colnames(cur_insertion) <- colnames(combined_df)
+    
+    ## fill the df
+    cur_row_counter <- 1
+    for (value in I1_NAs) # rows with NA is I1 should have a value in I2
+    {
+      cur_insertion$Index_2[cur_row_counter] <- aligned_df$Index_2[value]
+      cur_insertion$Time_2[cur_row_counter] <- aligned_df$Time_2[value]
+      cur_row_counter <- cur_row_counter+1
+    }
+    cur_row_counter <- 1
+    for (value in I2_NAs) # rows with NA is I2 should have a value in I1
+    {
+      cur_insertion$Index_1[cur_row_counter] <- aligned_df$Index_1[value]
+      cur_insertion$Time_1[cur_row_counter] <- aligned_df$Time_1[value]
+      cur_row_counter <- cur_row_counter+1
+    }
+    
+    # place the df where it goes in the overall df
+    top_half <- aligned_df[seq(1, iter-1),] # grab everything (which has already been examined) before this row
+    bottom_half <- aligned_df[seq(iter+length(I1_NAs)+length(I2_NAs), nrow(aligned_df)),] # grab everything after these (now corrected) NAs
+    cur_insertion <- rbind(top_half, cur_insertion, bottom_half)
+    
+    # reassign and correct row numbers
+    aligned_df <- cur_insertion
+    rownames(aligned_df) <- seq(1, nrow(aligned_df))
+    
+    iter <- iter + 1
+    
+    # # formerly:
+    # do NOT iterate the iter variable
+    # just let it do this row again and see it's full
+  
+    
+    
+    
+    
+    
+    
+    
+  } else # both columns have 1+ NAs, but they have different numbers of NAs
+  {
+    if (length(I1_NAs) < length(I2_NAs)) # I1 has fewer NAs marked... I2 has fewer beats marked
+    {
+      cur_tracker <- as.data.frame(matrix(data=NA, ncol=2, nrow=length(I1_NAs)))
+      colnames(cur_tracker) <- c("I1_Row", "I2_Row")
+      
+      cur_tracker$I2_Row <- I1_NAs
+      for (foo in 1:nrow(cur_tracker))
+      {
+        cur_I2_index <- cur_tracker$I2_Row[foo]
+        I2_compare_val <- aligned_df$Time_2[cur_I2_index]
+        
+        # cycle through I1 values and see which has closest value
+        cur_minimum_diff <- 999999
+        cur_minimum <- NA
+        for (comparer in 1:length(I2_NAs))
+        {
+          if (cur_minimum_diff > (I2_compare_val - aligned_df$Time_1[I2_NAs[comparer]]))
+          {
+            # the difference between this I2 value and the currently compared I1 time stamp is less than previously established minimum
+            ## i.e. this is a better match then previously established minimum
+            
+            # make sure this value has not already been used
+            if (length(which(cur_tracker$I1_Row == I2_NAs[comparer])) == 0) # no matches for this row value
+            {
+              # update minimum variables
+              cur_minimum_diff <- I2_compare_val - aligned_df$Time_1[I2_NAs[comparer]]
+              cur_minimum <- comparer
+            }
+          }
+        }
+        
+        # set this value in the tracker
+        # I2 row is already set (we drew from the foo'th row)
+        cur_tracker$I1_Row[foo] <- I2_NAs[cur_minimum]
+      }
+      
+      
+      
+    } else # I2 has fewer NAs marked... I1 has fewer beats marked
+    {
+      cur_tracker <- as.data.frame(matrix(data=NA, ncol=2, nrow=length(I2_NAs)))
+      colnames(cur_tracker) <- c("I1_Row", "I2_Row")
+      
+      cur_tracker$I1_Row <- I2_NAs
+      for (foo in 1:nrow(cur_tracker))
+      {
+        cur_I1_index <- cur_tracker$I1_Row[foo]
+        I1_compare_val <- aligned_df$Time_1[cur_I1_index]
+        
+        # cycle through I1 values and see which has closest value
+        cur_minimum_diff <- 999999
+        cur_minimum <- NA
+        for (comparer in 1:length(I1_NAs))
+        {
+          if (cur_minimum_diff > abs((I1_compare_val - aligned_df$Time_2[I1_NAs[comparer]])))
+          {
+            # the difference between this I2 value and the currently compared I1 time stamp is less than previously established minimum
+            ## i.e. this is a better match then previously established minimum
+            
+            # make sure this value has not already been used
+            if (length(which(cur_tracker$I2_Row == I1_NAs[comparer])) == 0) # no matches for this row value
+            {
+              # update minimum variables
+              cur_minimum_diff <- abs(I1_compare_val - aligned_df$Time_2[I1_NAs[comparer]])
+              cur_minimum <- comparer
+            }
+          }
+        }
+        
+        # set this value in the tracker
+        # I1 row is already set (we drew from the foo'th row)
+        cur_tracker$I2_Row[foo] <- I1_NAs[cur_minimum]
+      }
+    }
+    
+    # we now have the cur_tracker filled out for these NAs
+    
+    # create a data frame aligning these values correctly
+    ## initialise the df
+    cur_insertion <- as.data.frame(matrix(data=NA, nrow=nrow(cur_tracker), ncol=4))
+    colnames(cur_insertion) <- colnames(combined_df)
+    
+    ## fill the df
+    # put in the values with matches
+    for (bar in 1:nrow(cur_tracker))
+    {
+      cur_insertion$Index_1[bar] <- aligned_df$Index_1[cur_tracker$I1_Row[bar]]
+      cur_insertion$Index_2[bar] <- aligned_df$Index_2[cur_tracker$I2_Row[bar]]
+      cur_insertion$Time_1[bar] <- aligned_df$Time_1[cur_tracker$I1_Row[bar]]
+      cur_insertion$Time_2[bar] <- aligned_df$Time_2[cur_tracker$I2_Row[bar]]
+    }
+    
+    # put in the values without matches
+    if (length(I1_NAs) < length(I2_NAs)) # I1 has fewer NAs marked... I2 has fewer beats marked
+    {
+      # look for I1 row numbers (in I2_NAs) that never had a match
+      no_matches <- vector()
+      for (test_index in 1:length(I2_NAs))
+      {
+        if (length(which(cur_insertion$Index_1 == aligned_df$Index_1[I2_NAs[test_index]])) == 0)
+        {
+          # considering the I1 index number associated with this I2_NAs value, in aligned_df...
+          # are there any matches for the I1 index number in cur_insertion?
+          # if not, add it to the no_matches vector
+          no_matches <- c(no_matches, I2_NAs[test_index])
+        }
+      }
+      
+      for (test_index in no_matches)
+      {
+        temp_insert_row <- as.data.frame(matrix(data=NA, ncol=4, nrow=1))
+        colnames(temp_insert_row) <- colnames(cur_insertion)
+        
+        temp_insert_row$Index_1[1] <- aligned_df$Index_1[test_index] 
+        temp_insert_row$Time_1[1] <- aligned_df$Time_1[test_index]
+        
+        cur_insertion <- rbind(cur_insertion, temp_insert_row)
+      }
+      
+      cur_insertion <- cur_insertion[order(cur_insertion$Time_1),]
+      
+    } else # I2 has fewer NAs marked... I1 has fewer beats marked
+    {
+      # look for I2 row numbers (in I1_NAs) that never had a match
+      no_matches <- vector()
+      for (test_index in 1:length(I1_NAs))
+      {
+        if (length(which(cur_insertion$Index_2 == aligned_df$Index_2[I1_NAs[test_index]])) == 0)
+        {
+          # considering the I2 index number associated with this I1_NAs value, in aligned_df...
+          # are there any matches for the I2 index number in cur_insertion?
+          # if not, add it to the no_matches vector
+          no_matches <- c(no_matches, I1_NAs[test_index])
+        }
+      }
+      
+      for (test_index in no_matches)
+      {
+        temp_insert_row <- as.data.frame(matrix(data=NA, ncol=4, nrow=1))
+        colnames(temp_insert_row) <- colnames(cur_insertion)
+        
+        temp_insert_row$Index_2[1] <- aligned_df$Index_2[test_index] 
+        temp_insert_row$Time_2[1] <- aligned_df$Time_2[test_index]
+        
+        cur_insertion <- rbind(cur_insertion, temp_insert_row)
+      }
+      
+      cur_insertion <- cur_insertion[order(cur_insertion$Time_2),]
+    }
+    
+    # place the df where it goes in the overall df
+    top_half <- aligned_df[seq(1, iter-1),] # grab everything (which has already been examined) before this row
+    bottom_half <- aligned_df[seq(iter+length(I1_NAs)+length(I2_NAs), nrow(aligned_df)),] # grab everything after these (now corrected) NAs
+    cur_insertion <- rbind(top_half, cur_insertion, bottom_half)
+    
+    # reassign
+    aligned_df <- cur_insertion
+    rownames(aligned_df) <- seq(1, nrow(aligned_df))
+    
+    # do NOT iterate the iter variable
+    # just let it do this row again and see it's full
+    
+  }
+}
+
+writeLines(paste(included_IDs[j], " STEP THREE: Aligned dataframe assembled.", sep=""))
+
+# assign to own df
+assign(paste(included_IDs[j], "_", role, "_Combo", sep=""), aligned_df)
+} # end initial for loop (j)
+} # end initial for loop (role_num)
+
+# Clean Up
+remove(cur_R1_df, cur_R1_df_master, cur_R2_df, cur_R2_df_master)
+remove(aligned_df, combined_df, top_half, bottom_half, min_df, max_df)
+remove(cur_tracker, cur_insertion, temp_insert_row, temporary_df)
+remove(after_anchor_row, after_anchor, before_anchor_row, before_anchor, correct_place, start_check, stop_check, cur_NA_row)
+remove(I1_compare_val, I2_compare_val, I1_NAs, I2_NAs)
+remove(combined_row, comparer, no_matches, value)
+remove(foo, bar, iter, j, k, lmno, m, role, role_num, x, xyz, test_index, continue_running)
+remove(cur_combine_value, cur_I1_index, cur_I2_index, cur_I1_row, cur_I2_row, cur_minimum, cur_minimum_diff)
+
+```
+
+```{r}
+### AVERAGE SIMILAR BEAT TIMESTAMPS, AND DETERMINE OUTLIERS ###
+
+for (role_num in 1:2) # do for dr and pt
+{
+role <- roles[role_num]
+
+for (j in 1:length(included_IDs))
+{
+
+  
+### CALCULATE SDSD (aka SDRR) ###
+# Calculate successive differences across both rater's peak indications.
+# Calculate standard deviation across all successive diffs.
+## in BOTH R1 and R2 indications
+cur_df_R1 <- get(paste(included_IDs[j], "_", role, "_R1", sep=""))
+cur_df_R2 <- get(paste(included_IDs[j], "_", role, "_R2", sep=""))
+
+cur_df_R1$Diff <- NA
+cur_df_R2$Diff <- NA
+
+for (xyz in 2:nrow(cur_df_R1)) # skip first row... no row before
+{
+  cur_df_R1$Diff[xyz] <- cur_df_R1$Time[xyz] - cur_df_R1$Time[xyz-1]
+}
+for (xyz in 2:nrow(cur_df_R2)) # skip first row... no row before
+{
+  cur_df_R2$Diff[xyz] <- cur_df_R2$Time[xyz] - cur_df_R2$Time[xyz-1]
+}
+
+all_diffs <- c(cur_df_R1$Diff, cur_df_R2$Diff)
+all_diffs_SD <- sd(all_diffs, na.rm=TRUE)
+
+
+
+### CREATE SINGLE SET OF IDENTIFIED PEAKS ###
+cur_df_master <- get(paste(included_IDs[j], "_", role, "_Combo", sep=""))
+
+all_together <- as.data.frame(matrix(data=NA, nrow=1, ncol=2))
+colnames(all_together) <- c("Time", "Flag")
+
+# look through all rows and determine if:
+## (a) "error" beat (placed by one rater and not the other)
+## (b) too much variability in raters' indication of time stamp
+## (c) almost identical or identical time stamps (decisive beat)
+for (i in 1:nrow(cur_df_master))
+{
+  col1_time <- cur_df_master$Time_1[i]
+  col2_time <- cur_df_master$Time_2[i]
+  
+  temp_row <- as.data.frame(matrix(data=NA, nrow=1, ncol=2))
+  colnames(temp_row) <- colnames(all_together)
+  
+  if (is.na(col1_time) & is.na(col2_time))
+  {
+    # something weird here: should never have 2 NA times in same row
+    next
+  } else if (is.na(col1_time))
+  {
+    # NA in Column 1 and not an NA in Column 2
+    # one rater indicated an extra beat
+    temp_row$Time[1] <- col2_time
+    temp_row$Flag[1] <- 1 # problem beat: "extra" beat
+  } else if (is.na(col2_time))
+  {
+    # NA in Column 2 and not an NA in Column 1
+    # one rater indicated an extra beat
+    temp_row$Time[1] <- col1_time
+    temp_row$Flag[1] <- 1 # problem beat: "extra" beat
+  } else 
+  {
+    # both not NAs: should be able to average values
+    # these beats have been paired... theoretically, should exactly match
+    # however, it is unlikely they will *exactly* match (if identical, likely to have been beats correctly placed by automatic beat detector)
+    # substantially differing timestamps are defined as being more than 1 SDSD different from each other
+    ## why 1 SDSD different?
+    ##if you are more than 1 SDSD (essentially, a standard deviation of an IBI) different from the other rater's rating of this "same" heartbeat...
+    ## you are not close enough together for you two to be rating the same peak of the same heartbeat complex
+    ## thus something is off and a third party needs to evaluate
+    substantial <- all_diffs_SD
+    
+    if (abs(col2_time - col1_time) > substantial) # too dissimilar
+    {
+      temp_row <- rbind(temp_row, temp_row) # make it 2 rows by doubling it
+      temp_row$Time[1] <- col1_time
+      temp_row$Time[2] <- col2_time
+      temp_row$Flag <- 2 # flag both as problem beat: too much variance in two raters
+    } else # similar enough
+    {
+      temp_row$Flag[1] <- 0 # flag as non-problem beat
+      temp_row$Time[1] <- mean(col1_time, col2_time)
+    }
+
+  }
+  
+  all_together <- rbind(all_together, temp_row)
+}
+# remove empty first row from initialization
+all_together <- all_together[-c(1),]
+
+### SET UP IMPORTING DF ###
+import_bp <- as.data.frame(matrix(NA, ncol=6, nrow=nrow(all_together)))
+colnames(import_bp) <- c("Time_Relative_sf","Duration_sf","Observation","Event_Log","Behavior","Event_Type")
+import_bp$Time_Relative_sf <- all_together$Time
+
+for (z in 1:nrow(all_together))
+{
+  if (all_together$Flag[z] == 0) # good beats
+  {
+    import_bp$Behavior[z] <- paste(role, "_Peak", sep="")
+  } else if (all_together$Flag[z] == 1) # problem beat: "extra" beat
+  {
+    import_bp$Behavior[z] <- paste(role, "_Extra", sep="")
+  } else if (all_together$Flag[z] == 2) # problem beat: too much variance in two raters
+  {
+    import_bp$Behavior[z] <- paste(role, "_Diff", sep="")
+  } else # error
+  {
+    import_bp$Behavior[z] <- paste(role, "_Unknown", sep="")
+  }
+}
+
+# set constant values
+import_bp$Duration_sf <- 0
+import_bp$Observation <- "Observation 1"
+import_bp$Event_Log <- "Event log"
+import_bp$Event_Type <- "Point"
+
+# assign to own df
+assign(paste(included_IDs[j], "_", role, "_3R", sep=""), import_bp)
+
+writeLines(paste(included_IDs[j], " is complete.", sep=""))
+
+} # end for loop (j)
+} # end for loop (role_num)
+
+```
+
+```{r}
+# write out files to be read into BIOPAC for third rater
+for (j in 1:length(included_IDs))
+{
+  cur_P1_df <- get(paste(included_IDs[j], "_P1_3R", sep=""))
+  cur_P2_df <- get(paste(included_IDs[j], "_P2_3R", sep=""))
+
+  cur_final_import <- rbind(cur_P1_df, cur_P2_df)
+
+  write.table(cur_final_import, file=paste(save_report_dir, included_IDs[j], "_3R.txt", sep=""), quote=FALSE, sep='\t', row.names = FALSE)
+}
+
+```
